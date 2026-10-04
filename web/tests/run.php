@@ -1,0 +1,46 @@
+<?php
+declare(strict_types=1);
+$dir=sys_get_temp_dir().'/idlaps-test-'.bin2hex(random_bytes(5));mkdir($dir);
+$config=$dir.'/config.php';file_put_contents($config,"<?php return ".var_export(['dsn'=>'sqlite:'.$dir.'/test.db','allow_http_local'=>true],true).';');putenv('IDLAPS_CONFIG='.(getenv('IDLAPS_TEST_CONFIG')?:$config));
+require dirname(__DIR__).'/app/bootstrap.php';install_schema(db());
+$checks=0;
+function check(bool $condition,string $message): void { global $checks; if(!$condition) throw new RuntimeException('FAIL: '.$message); $checks++; echo "PASS $message\n"; }
+$gun=1700000000000;
+$cat=['id'=>1,'name'=>'Elite','scheduled_ms'=>$gun,'official_ms'=>null,'bike_laps'=>1,'run_laps'=>1,'bike_min_s'=>60,'run_min_s'=>30];
+$p=['bib'=>'007','name'=>'Ayu','team'=>'Club','category_id'=>1,'epc'=>'ABCD','race_status'=>'active'];
+function observation(string $source,int $cp,int $ms,?string $stage=null,int $lap=1,string $id=''): array {
+    return ['source'=>$source,'checkpoint'=>$cp,'captured_ms'=>$ms,'stage'=>$stage,'lap'=>$lap,'record_id'=>$id?:uniqid('r',true),'reader_id'=>$cp,'bib'=>'007','epc'=>'ABCD','clock_quality'=>'synced','test'=>0,'cancelled'=>0,'payload_json'=>json_encode(['quiet_ms'=>2000,'interval_ms'=>10000,'detect_mode'=>'multi'])];
+}
+$base=[observation('rfid',1,$gun+600000),observation('rfid',2,$gun+660000),observation('rfid',3,$gun+1800000),observation('rfid',2,$gun+1860000),observation('rfid',4,$gun+2400000)];
+$r=calculate_results([$cat],[$p],$base,[])[0];check($r['status']==='Selesai'&&$r['total_ms']===2400000&&$r['t2_ms']===60000,'RFID route, transitions and gun time');
+$manual=observation('manual',1,$gun+601000,'swim_finish');
+$r=calculate_results([$cat],[$p],array_merge($base,[$manual]),[])[0];check($r['swim_ms']===601000&&$r['sources']['swim_finish:1']==='manual','Late manual overrides RFID without duplicate crossing');
+$earlier=$cat;$earlier['official_ms']=$gun-5000;
+$r2=calculate_results([$earlier],[$p],array_merge($base,[$manual]),[])[0];check($r2['total_ms']===$r['total_ms']+5000&&$r2['t1_ms']===$r['t1_ms'],'Official gun correction leaves transitions unchanged');
+$missing=$base;unset($missing[1]);$r=calculate_results([$cat],[$p],$missing,[])[0];check($r['status']==='Perlu diperiksa'&&!isset($r['times']['cycle_start:1']),'Shared checkpoint does not guess after a missing crossing');
+$duplicateManual=[$manual,observation('manual',1,$gun+602000,'swim_finish')];$r=calculate_results([$cat],[$p],array_merge($base,$duplicateManual),[])[0];check($r['status']==='Perlu diperiksa','Duplicate manual requires review');
+$bad=$base;$bad[]=observation('manual',2,$gun+500000,'cycle_start');$r=calculate_results([$cat],[$p],$bad,[])[0];check($r['status']==='Perlu diperiksa','Negative transition is not clamped or silently replaced');
+$test=$base;$test[4]['test']=1;$r=calculate_results([$cat],[$p],$test,[])[0];check($r['total_ms']===null,'Test observations excluded');
+$group=[];for($i=0;$i<60;$i++)$group[]=observation('rfid',1,$gun+$i*1000);check(count(rfid_passages($group))===1,'Stationary tag does not create new laps after cooldown');
+$group=[observation('rfid',1,$gun),observation('rfid',1,$gun+1000)];$group[1]['reader_id']=99;check(count(rfid_passages($group))===1,'Two readers on one line merge their crossing');
+$multi=$cat;$multi['bike_laps']=2;$multi['run_laps']=2;$multiObs=$base; $multiObs[2]['captured_ms']=$gun+1200000;$multiObs[]=observation('rfid',3,$gun+1800000);$multiObs[4]['captured_ms']=$gun+2100000;$multiObs[]=observation('rfid',4,$gun+2400000);$r=calculate_results([$multi],[$p],$multiObs,[])[0];check($r['status']==='Selesai'&&isset($r['times']['cycle_lap:1'])&&isset($r['times']['run_finish:2']),'Configured multi-lap route');
+query('INSERT INTO events(name,timezone,created_ms) VALUES(?,?,?)',['Test','Asia/Jakarta',$gun]);
+query('INSERT INTO categories(event_id,name,scheduled_ms) VALUES(?,?,?)',[1,'Elite',$gun]);
+query('INSERT INTO participants(event_id,category_id,bib,name,epc) VALUES(?,?,?,?,?)',[1,1,'007','Ayu','ABCD']);
+query('INSERT INTO devices(event_id,name,kind,checkpoint,token_hash) VALUES(?,?,?,?,?)',[1,'Phone','manual',1,hash('sha256','token')]);
+$device=one('SELECT * FROM devices WHERE id=1');
+$row=['record_id'=>'manual-test-1','event_id'=>1,'bib'=>'007','checkpoint'=>1,'stage'=>'swim_finish','lap'=>1,'captured_ms'=>$gun+600000,'clock_quality'=>'synced','config_version'=>1];
+$reply=ingest($device,[$row]);check($reply['accepted_ids']===['manual-test-1'],'First manual upload acknowledged per ID');
+$revision=(int)query('SELECT revision FROM events WHERE id=1')->fetchColumn();
+$reply=ingest($device,[$row]);check(count(rows('SELECT * FROM observations'))===1&&(int)query('SELECT revision FROM events WHERE id=1')->fetchColumn()===$revision,'Retry after lost response is idempotent and does not stale results');
+$conflict=$row;$conflict['captured_ms']++;$reply=ingest($device,[$conflict]);check(count($reply['rejected'])===1,'Changed payload with same ID rejected');
+$bad=$row;$bad['record_id']='manual-test-2';$bad['bib']='999';$reply=ingest($device,[$row,$bad]);check(count($reply['accepted_ids'])===1&&count($reply['rejected'])===1,'Partial batch response retains rejected records');
+$cross=$row;$cross['record_id']='manual-test-3';$cross['event_id']=2;check(count(ingest($device,[$cross])['rejected'])===1,'Device cannot write another event');
+$blank=$row;unset($blank['captured_ms']);$blank['record_id']='manual-test-4';check(count(ingest($device,[$blank])['rejected'])===1,'Missing timestamp rejected');
+$workbook=excel_template();$sheet=$workbook->getActiveSheet();foreach(['008','Budi','Elite','0000AB12','Club'] as $i=>$v)$sheet->setCellValueExplicit([$i+1,2],$v,\PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
+$path=$dir.'/participants.xlsx';(new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($workbook))->save($path);$preview=preview_import($path,1);check(!$preview['errors']&&$preview['rows'][0]['bib']==='008'&&$preview['rows'][0]['epc']==='0000AB12','Excel preserves leading zeros');
+$sheet->setCellValue('B2','=1+1');(new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($workbook))->save($path);check(count(preview_import($path,1)['errors'])===1,'Import rejects formulas');
+$event=one('SELECT * FROM events WHERE id=1');$run=['official'=>0,'created_ms'=>$gun];$results=calculate_results([$cat],[$p],$base,[]);
+$out=result_book($event,$run,$results);$x=$dir.'/results.xlsx';(new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($out))->save($x);$loaded=\PhpOffice\PhpSpreadsheet\IOFactory::load($x);check($loaded->getActiveSheet()->getCell('B6')->getValue()==='007','Result XLSX retains BIB text');
+$pdf=result_pdf($event,$run,$results);check(str_starts_with($pdf,'%PDF-'),'PDF export renders');file_put_contents($dir.'/results.pdf',$pdf);
+echo "\n$checks checks passed. Artifacts: $dir\n";

@@ -1,0 +1,19 @@
+name: Windows desktop
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r desktop/requirements.txt
+      - run: python -m unittest discover -s desktop/tests
+        env:
+          PYTHONPATH: desktop
+      - run: pyinstaller --noconfirm --clean --onefile --windowed --name IDLAPS-Triathlon desktop/main.py --paths desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IDLAPS-Triathlon-Windows
+          path: dist/IDLAPS-Triathlon.exe

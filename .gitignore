@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+web/vendor/
+web/config/local.php
+web/storage/*
+!web/storage/.htaccess
+!web/storage/.gitkeep
+dist/*
+!dist/.gitkeep
+*.db
+.DS_Store
+build/
