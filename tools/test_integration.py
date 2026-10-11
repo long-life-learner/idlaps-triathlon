@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -18,7 +19,7 @@ ROOT=Path(__file__).resolve().parents[1]
 class Integration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temp=tempfile.TemporaryDirectory();folder=Path(cls.temp.name)
+        cls.temp=tempfile.TemporaryDirectory();folder=Path(cls.temp.name);cls.database=folder/'test.db'
         config=folder/'config.php';config.write_text("<?php return ['dsn'=>'sqlite:"+str(folder/'test.db')+"','allow_http_local'=>true];")
         cls.env=dict(os.environ,IDLAPS_CONFIG=str(config))
         subprocess.run(['php',str(ROOT/'web/tests/fixture.php')],env=cls.env,check=True)
@@ -45,6 +46,20 @@ class Integration(unittest.TestCase):
     def record(self,id):
         return {'record_id':id,'event_id':1,'bib':'007','checkpoint':1,'stage':'swim_finish','lap':1,'captured_ms':int(time.time()*1000),'clock_quality':'synced','config_version':1}
 
+    def test_multi_epc_form_api_and_observation_filter(self):
+        s=requests.Session();login=s.get(self.url+'/index.php?page=login')
+        csrf=re.search(r'name="csrf" value="([^"]+)"',login.text)[1]
+        r=s.post(self.url+'/index.php?page=login',data={'csrf':csrf,'username':'tester','password':'local-only-test-password'})
+        csrf=re.search(r'name="csrf" value="([^"]+)"',r.text)[1]
+        r=s.post(self.url+'/index.php?page=participants',data={'action':'participant','csrf':csrf,'id':1,'bib':'007','name':'Test Athlete','category_id':1,'epc':'ABCD, 0002','race_status':'active'})
+        self.assertIn('ABCD, 0002',r.text)
+        cfg=requests.get(self.url+'/api.php?action=config',headers={'Authorization':'Bearer '+self.tokens['rfid']}).json()['config']
+        self.assertEqual(cfg['participants'][0]['epcs'],['ABCD','0002'])
+        row={'record_id':'integration-secondary-epc','event_id':1,'epc':'0002','reader_id':1,'checkpoint':1,'captured_ms':int(time.time()*1000),'clock_quality':'synced','config_version':1}
+        self.assertEqual(self.call('upload',{'data':[row]},kind='rfid').json()['accepted_ids'],[row['record_id']])
+        page=s.get(self.url+'/index.php?page=observations&bib=007')
+        self.assertEqual(page.status_code,200);self.assertIn('<td>0002</td>',page.text)
+
     def test_pair_once_and_authentication(self):
         self.assertEqual(requests.post(self.url+'/api.php?action=pair',json={'code':'TEST-MANUAL'}).status_code,401)
         self.assertEqual(requests.get(self.url+'/api.php?action=config').status_code,401)
@@ -60,6 +75,18 @@ class Integration(unittest.TestCase):
         r=self.call('cancel',{'record_ids':[valid['record_id']]});self.assertEqual(r.status_code,200);self.assertEqual(r.json()['accepted_ids'],[valid['record_id']])
         self.assertEqual(self.call('cancel',{'record_ids':[valid['record_id']]},kind='rfid').status_code,404)
 
+    def test_cancel_before_upload_and_retry_after_admin_restore(self):
+        record=self.record('integration-cancel-first')
+        r=self.call('cancel',{'record_ids':[record['record_id']]})
+        self.assertEqual(r.json()['accepted_ids'],[record['record_id']])
+        self.assertEqual(self.call('upload',{'data':[record]}).json()['accepted_ids'],[record['record_id']])
+        with sqlite3.connect(self.database) as db:
+            self.assertEqual(db.execute('SELECT cancelled FROM observations WHERE record_id=?',(record['record_id'],)).fetchone()[0],1)
+            db.execute('UPDATE observations SET cancelled=0 WHERE record_id=?',(record['record_id'],))
+        self.call('cancel',{'record_ids':[record['record_id']]})
+        with sqlite3.connect(self.database) as db:
+            self.assertEqual(db.execute('SELECT cancelled FROM observations WHERE record_id=?',(record['record_id'],)).fetchone()[0],0)
+
     def test_admin_login_calculate_export_and_csrf(self):
         s=requests.Session();login=s.get(self.url+'/index.php?page=login')
         csrf=re.search(r'name="csrf" value="([^"]+)"',login.text)[1]
@@ -74,7 +101,9 @@ class Integration(unittest.TestCase):
         pdf=s.get(self.url+'/index.php?page=pdf');self.assertEqual(pdf.status_code,200);self.assertTrue(pdf.content.startswith(b'%PDF-'))
         self.call('upload',{'data':[self.record('integration-stale-1')]})
         self.assertEqual(s.get(self.url+'/index.php?page=excel').status_code,409)
-        for page in ['categories','participants','devices','observations','legacy','audit']:
+        self.assertNotIn('Arsip manual lama',r.text)
+        self.assertEqual(s.get(self.url+'/index.php?page=legacy').status_code,404)
+        for page in ['categories','participants','devices','observations','audit']:
             self.assertEqual(s.get(self.url+'/index.php?page='+page).status_code,200)
 
 if __name__=='__main__':unittest.main(verbosity=2)

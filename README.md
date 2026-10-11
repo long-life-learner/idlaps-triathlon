@@ -14,6 +14,14 @@ Implementasi admin/API PHP native, pencatat RFID Windows (Python/PySide6), dan p
 
 Mulai dari [panduan pemasangan](docs/PEMASANGAN.md) dan [panduan operator](docs/OPERASI.md). Detail API ada di [API.md](docs/API.md).
 
+Hosting yang sudah tersambung ke repository dapat diperbarui dengan pull branch `main`, tanpa mengunduh ZIP lagi. Ikuti [panduan pembaruan melalui GitHub](docs/PEMBARUAN-GITHUB.md).
+
+Pembaruan 2.2 menambahkan status DNS/DNF/DSQ dari hasil, penetapan resmi per kategori, dan antrean Android lintas penugasan. BIB dibatasi 1–3 digit dengan nama/kategori ditampilkan sebelum pencatatan. Server Android tetap `https://triathlon.idlaps.com`. Menu arsip manual lama sudah dihapus. Lihat [panduan pembaruan](docs/PEMBARUAN-2.2.md). File untuk dibuild ulang adalah `dist/IDLAPSTriathlonTap-2.2.aia`.
+
+Paket shared hosting beserta dependensinya ada di `dist/idlaps-shared-hosting.zip`; sumber Windows beserta skrip build ada di `dist/idlaps-desktop-windows-source.zip`. Buat ulang paket setelah perubahan dengan `python tools/package.py`.
+
+Pembaruan web/desktop 2.3 mendukung beberapa EPC per BIB, termasuk impor Excel dan penggabungan hasil. Alamat desktop juga tetap `https://triathlon.idlaps.com`. Lihat [panduan 2.3 dan arti pengaturan reader](docs/PEMBARUAN-2.3.md). Kodular tetap versi 2.2.
+
 ## Keputusan utama
 
 - Satu kategori memiliki satu pelepasan dan gun time masing-masing; tanggal lengkap mendukung event beberapa hari.
@@ -53,9 +61,12 @@ Pada Windows gunakan `.venv\Scripts\python` atau jalankan `desktop/build-windows
 
 ```sh
 php web/tests/run.php
+php web/tests/categories.php
+php web/tests/multi_epc.php
 PYTHONPATH=desktop .venv/bin/python -m unittest discover -s desktop/tests -v
 .venv/bin/python tools/test_integration.py
-python tools/validate_android.py android/IDLAPSTriathlonTap.aia
+python3 tools/validate_android.py android/IDLAPSTriathlonTap.aia
+python3 tools/test_android_runtime.py
 ```
 
 `web/tests/run.php` secara default membuat database SQLite sementara. `IDLAPS_TEST_CONFIG=/path/test-config.php` menjalankan tes yang sama terhadap **database MySQL kosong khusus tes**. Jangan arahkan ke database produksi.

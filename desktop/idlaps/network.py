@@ -3,6 +3,9 @@ from urllib.parse import urlparse
 import requests
 
 
+SERVER_URL = "https://triathlon.idlaps.com"
+
+
 class Api:
     def __init__(self, url, token=""):
         url = url.strip().rstrip("/")

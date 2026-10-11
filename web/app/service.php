@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 function device_config(array $device): array {
     $event=one('SELECT * FROM events WHERE id=?',[$device['event_id']]);
-    return ['event'=>$event,'device'=>array_intersect_key($device,array_flip(['id','name','kind','checkpoint','config_version'])),'categories'=>rows('SELECT * FROM categories WHERE event_id=?',[$event['id']]),'participants'=>rows('SELECT bib,name,category_id,epc FROM participants WHERE event_id=?',[$event['id']]),'readers'=>rows('SELECT * FROM readers WHERE device_id=? AND enabled=1',[$device['id']]),'server_ms'=>now_ms()];
+    return ['event'=>$event,'device'=>array_intersect_key($device,array_flip(['id','name','kind','checkpoint','config_version'])),'categories'=>rows('SELECT * FROM categories WHERE event_id=?',[$event['id']]),'participants'=>with_participant_tags(rows('SELECT id,bib,name,category_id,epc FROM participants WHERE event_id=?',[$event['id']]),(int)$event['id']),'readers'=>rows('SELECT * FROM readers WHERE device_id=? AND enabled=1',[$device['id']]),'server_ms'=>now_ms()];
 }
 function canonical_json(array $value): string { $sort=function(&$a) use (&$sort) { if(!is_array($a)) return; if(!array_is_list($a)) ksort($a); foreach($a as &$v) if(is_array($v)) $sort($v); }; $sort($value); return json_encode($value,JSON_UNESCAPED_UNICODE|JSON_PRESERVE_ZERO_FRACTION|JSON_THROW_ON_ERROR); }
 function normalize_observation(array $row,array $device): array {
@@ -16,6 +16,7 @@ function normalize_observation(array $row,array $device): array {
     if($device['kind']==='manual') {
         if($cp!==(int)$device['checkpoint']) throw new InvalidArgumentException('Checkpoint tidak sesuai perangkat.');
         $bib=trim((string)($row['bib']??''));
+        if(!preg_match('/^[0-9]{1,3}$/D',$bib)) throw new InvalidArgumentException('BIB harus berisi 1–3 digit angka.');
         $p=one('SELECT p.*,c.bike_laps,c.run_laps FROM participants p JOIN categories c ON c.id=p.category_id WHERE p.event_id=? AND p.bib=?',[$device['event_id'],$bib]);
         if(!$p) throw new InvalidArgumentException('BIB belum terdaftar dalam event.');
         $stage=(string)($row['stage']??''); $lap=(int)($row['lap']??1);
@@ -39,7 +40,7 @@ function normalize_observation(array $row,array $device): array {
 }
 function ingest(array $device,array $data): array {
     if(count($data)>500) throw new InvalidArgumentException('Maksimal 500 catatan per kiriman.');
-    $accepted=[]; $rejected=[]; $changed=false;
+    $accepted=[]; $rejected=[]; $changed=false; $affected=[];
     db()->beginTransaction();
     try {
         lock_event((int)$device['event_id']);
@@ -56,9 +57,9 @@ function ingest(array $device,array $data): array {
             catch(InvalidArgumentException $e) { $rejected[]=['record_id'=>$id,'message'=>$e->getMessage()]; continue; }
             if(one('SELECT id FROM cancel_requests WHERE record_id=? AND device_id=?',[$id,$device['id']])) $values[15]=1;
             query('INSERT INTO observations(record_id,event_id,device_id,source,bib,epc,reader_id,checkpoint,stage,lap,captured_ms,received_ms,clock_quality,uncertainty_ms,test,cancelled,config_version,payload_hash,payload_json) VALUES('.implode(',',array_fill(0,19,'?')).')',$values);
-            $accepted[]=$id; if(!$values[14]) $changed=true;
+            $accepted[]=$id; if(!$values[14]) { $changed=true; $affected=array_merge($affected,observation_categories((int)$device['event_id'],$values[4],$values[5])); }
         }
-        if($changed) { revise((int)$device['event_id']); query('UPDATE devices SET manual_complete=0 WHERE id=?',[$device['id']]); }
+        if($changed) { revise((int)$device['event_id'],array_values(array_unique($affected)));  query('UPDATE devices SET manual_complete=0 WHERE id=?',[$device['id']]); }
         query('UPDATE devices SET last_seen_ms=? WHERE id=?',[now_ms(),$device['id']]);
         db()->commit();
     } catch(Throwable $e) { db()->rollBack(); throw $e; }
@@ -68,17 +69,18 @@ function compute_event(int $id): array {
     db()->beginTransaction();
     try {
         $event=lock_event($id);
-        $participants=rows('SELECT * FROM participants WHERE event_id=?',[$id]);
+        $participants=with_participant_tags(rows('SELECT * FROM participants WHERE event_id=?',[$id]),$id);
         $categories=rows('SELECT * FROM categories WHERE event_id=?',[$id]);$categoryMap=array_column($categories,null,'id');
         $observations=rows('SELECT * FROM observations WHERE event_id=? AND source=? AND test=0 AND cancelled=0 ORDER BY captured_ms,id',[$id,'manual']);
         // Stream dense RF observations instead of loading the entire event into PHP memory.
         foreach($participants as $participant) {
-            if(!$participant['epc']) continue;
+            if(!$participant['epcs']) continue;
             $mysql=db()->getAttribute(PDO::ATTR_DRIVER_NAME)==='mysql';
             if($mysql) db()->setAttribute(PDO::MYSQL_ATTR_USE_BUFFERED_QUERY,false);
             try {
                 $category=$categoryMap[$participant['category_id']];$gun=(int)($category['official_ms']??$category['scheduled_ms']);
-                $stmt=query('SELECT * FROM observations WHERE event_id=? AND epc=? AND source=? AND test=0 AND cancelled=0 AND captured_ms>=? ORDER BY captured_ms,id',[$id,$participant['epc'],'rfid',$gun]);
+                $slots=implode(',',array_fill(0,count($participant['epcs']),'?'));
+                $stmt=query('SELECT * FROM observations WHERE event_id=? AND epc IN ('.$slots.') AND source=? AND test=0 AND cancelled=0 AND captured_ms>=? ORDER BY captured_ms,id',array_merge([$id],$participant['epcs'],['rfid',$gun]));
                 $seen=[];
                 while($o=$stmt->fetch()) {
                     $p=json_decode($o['payload_json'],true)?:[];$k=$o['reader_id'];$t=(int)$o['captured_ms'];$s=$seen[$k]??null;
@@ -90,6 +92,7 @@ function compute_event(int $id): array {
         }
         $results=calculate_results($categories,$participants,$observations,rows('SELECT * FROM decisions WHERE event_id=?',[$id]));
         query('INSERT INTO result_runs(event_id,revision,created_ms,official,result_json) VALUES(?,?,?,?,?)',[$id,$event['revision'],now_ms(),0,json_encode($results,JSON_THROW_ON_ERROR)]);
+        $runId=(int)db()->lastInsertId(); foreach($categories as $category) query('INSERT INTO result_category_versions(run_id,category_id,revision) VALUES(?,?,?)',[$runId,$category['id'],category_revision((int)$category['id'])]);
         audit($id,'calculate',['revision'=>$event['revision'],'participants'=>count($results)]);
         db()->commit(); return $results;
     } catch(Throwable $e) { db()->rollBack(); throw $e; }

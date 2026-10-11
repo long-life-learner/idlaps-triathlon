@@ -14,8 +14,10 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QMessageBox, QHeaderView, QFileDialog)
 from .storage import Store
 from .clock import RaceClock
-from .network import Api
+from .network import Api, SERVER_URL
 from .reader import ReaderWorker
+
+CLOCK_LABELS = {'synced': 'selaras', 'holdover': 'acuan terakhir', 'unverified': 'belum diperiksa', 'stale': 'perlu diselaraskan', 'jump': 'perubahan jam perlu diperiksa'}
 
 
 class Bus(QObject):
@@ -48,10 +50,9 @@ class Window(QMainWindow):
         self.assignment = QLabel("Pasangkan komputer dengan event"); self.assignment.setObjectName("title"); layout.addWidget(self.assignment)
         self.connection = QLabel("Konfigurasi belum diunduh"); layout.addWidget(self.connection)
         self.pair_box = QWidget(); pair = QVBoxLayout(self.pair_box)
-        self.url = QLineEdit(store.get("url", "")); self.url.setPlaceholderText("https://alamat-admin-anda.com")
         self.code = QLineEdit(); self.code.setPlaceholderText("Kode pemasangan dari admin")
         self.pair_button = QPushButton("Hubungkan & unduh konfigurasi"); self.pair_button.clicked.connect(self.pair)
-        pair.addWidget(QLabel("Alamat aplikasi admin")); pair.addWidget(self.url); pair.addWidget(self.code); pair.addWidget(self.pair_button)
+        pair.addWidget(QLabel("Server: " + SERVER_URL)); pair.addWidget(self.code); pair.addWidget(self.pair_button)
         layout.addWidget(self.pair_box)
         self.tabs = QTabWidget(); layout.addWidget(self.tabs)
         race = QWidget(); race_layout = QVBoxLayout(race)
@@ -92,21 +93,21 @@ class Window(QMainWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def pair(self):
-        url, code = self.url.text().strip(), self.code.text().strip()
+        code = self.code.text().strip()
         def task():
-            api = Api(url); data = api.call("pair", {"code": code})
+            api = Api(SERVER_URL); data = api.call("pair", {"code": code})
             if data["config"]["device"]["kind"] != "rfid":
                 raise ValueError("Kode ini untuk Android manual. Buat ulang kode desktop RFID melalui admin.")
             counts = self.store.counts()
             if self.config and (counts.get("pending", 0) or counts.get("rejected", 0)) and int(data["config"]["device"]["id"]) != int(self.config["device"]["id"]):
                 raise ValueError("Masih ada antrean pada penugasan lama. Kirim dahulu. Kode baru sudah terpakai; minta admin membuat ulang setelah antrean selesai.")
-            self.store.set("url", url); self.store.set("token", data["token"])
+            self.store.set("url", SERVER_URL); self.store.set("token", data["token"])
             return data["config"]
         self.background(task)
 
     def download(self):
         if self.workers: return
-        self.background(lambda: Api(self.store.get("url"), self.store.get("token")).call("config")["config"])
+        self.background(lambda: Api(SERVER_URL, self.store.get("token")).call("config")["config"])
 
     def configured(self, config):
         self.config = config; self.store.set("config", config)
@@ -160,7 +161,7 @@ class Window(QMainWindow):
             if not token or not cfg:
                 self.stop_network.wait(1); continue
             try:
-                api = Api(self.store.get("url"), token)
+                api = Api(SERVER_URL, token)
                 if time.monotonic() - last_clock > 60:
                     try: api.synchronize(self.clock, self.store)
                     except Exception as e: self.bus.network.emit("Jam belum terverifikasi: " + str(e))
@@ -171,7 +172,7 @@ class Window(QMainWindow):
                     self.store.acknowledge([r["record_id"] for r in batch], reply.get("accepted_ids", []), reply.get("rejected", []))
                 counts = self.store.counts(); clock = self.clock.stamp()
                 api.call("heartbeat", {"pending_count": counts.get("pending", 0)+counts.get("rejected", 0), "clock_quality": clock["clock_quality"]})
-                self.bus.network.emit("Server terhubung · jam " + clock["clock_quality"])
+                self.bus.network.emit("Server terhubung · jam " + CLOCK_LABELS[clock["clock_quality"]])
                 backoff = 2
             except Exception:
                 self.bus.network.emit("Server belum terhubung · data tetap disimpan di komputer")
@@ -190,7 +191,7 @@ class Window(QMainWindow):
                 self.reader_totals[rid] = self.reader_totals.get(rid, 0) + 1
                 if len(self.latest) > 200: del self.latest[next(iter(self.latest))]
         if not self.config: return
-        participants = {p["epc"]: p for p in self.config["participants"] if p["epc"]}
+        participants = {epc.upper(): p for p in self.config["participants"] for epc in p.get("epcs", [p["epc"]] if p.get("epc") else [])}
         readers = {int(r["id"]): r for r in self.config["readers"]}
         newest = sorted(self.latest.values(), key=lambda x: x["captured_ms"], reverse=True)
         self.history.setRowCount(len(newest))
@@ -207,7 +208,7 @@ class Window(QMainWindow):
             for c, text in enumerate(cells): self.readers_table.setItem(n, c, QTableWidgetItem(str(text)))
         self.reader_health.setText("\n".join(r["name"] + ": " + self.reader_status.get(int(r["id"]), "Belum diuji") for r in self.config["readers"]))
         counts = self.store.counts(); stamp = self.clock.stamp()
-        self.counters.setText(f"Tersimpan: {sum(counts.values())}  ·  Menunggu kirim: {counts.get('pending', 0)}  ·  Perlu diperiksa: {counts.get('rejected', 0)}  ·  Jam: {stamp['clock_quality']}")
+        self.counters.setText(f"Tersimpan: {sum(counts.values())}  ·  Menunggu kirim: {counts.get('pending', 0)}  ·  Perlu diperiksa: {counts.get('rejected', 0)}  ·  Jam: {CLOCK_LABELS[stamp['clock_quality']]}")
         self.errors_label.setText("\n".join(f"{r}: {e}" for r, e in self.store.errors()))
         self.retry.setVisible(bool(counts.get("rejected")))
 

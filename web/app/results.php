@@ -39,7 +39,7 @@ function rfid_passages(array $observations): array {
 
 function calculate_results(array $categories,array $participants,array $observations,array $decisions): array {
     $cats=array_column($categories,null,'id'); $byBib=[]; $epcs=[];
-    foreach($participants as $p) if(!empty($p['epc'])) $epcs[strtoupper($p['epc'])]=$p['bib'];
+    foreach($participants as $p) foreach($p['epcs']??(empty($p['epc'])?[]:[$p['epc']]) as $epc) $epcs[strtoupper($epc)]=$p['bib'];
     foreach($observations as $o) {
         if((int)$o['test'] || (int)$o['cancelled']) continue;
         $bib=$o['source']==='rfid'?($epcs[strtoupper($o['epc']??'')]??null):$o['bib'];

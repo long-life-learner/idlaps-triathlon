@@ -2,7 +2,7 @@
 declare(strict_types=1);
 $message=''; $done=false;
 try {
-    require dirname(__DIR__).'/app/bootstrap.php'; session_start_safe();
+    require dirname(__DIR__).'/app/bootstrap.php'; require_https(); session_start_safe();
     try { $exists=one('SELECT id FROM users LIMIT 1'); } catch(PDOException $e) { $exists=null; }
     if($exists) { http_response_code(403); exit('Pemasangan sudah selesai. Buka index.php untuk masuk.'); }
     if($_SERVER['REQUEST_METHOD']==='POST') {

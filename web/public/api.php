@@ -4,7 +4,7 @@ $received=(int)floor(microtime(true)*1000);
 try {
     require dirname(__DIR__).'/app/bootstrap.php';
     header('Cache-Control: no-store');
-    if(empty($_SERVER['HTTPS']) && !config()['allow_http_local']) json_out(['ok'=>false,'message'=>'HTTPS wajib.'],400);
+    if((empty($_SERVER['HTTPS']) || $_SERVER['HTTPS']==='off') && empty(config()['allow_http_local'])) json_out(['ok'=>false,'message'=>'HTTPS wajib.'],400);
     $action=$_GET['action']??'';
     if($action==='time') json_out(['ok'=>true,'received_ms'=>$received,'server_ms'=>now_ms()]);
     $raw=file_get_contents('php://input',false,null,0,2097153);
@@ -34,17 +34,18 @@ try {
         if(!is_array($ids)||count($ids)>100) json_out(['ok'=>false,'message'=>'Maksimal 100 pembatalan.'],400);
         db()->beginTransaction();
         try {
-            lock_event((int)$d['event_id']); $accepted=[]; $rejected=[]; $changed=false;
+            lock_event((int)$d['event_id']); $accepted=[]; $rejected=[]; $changed=false; $affected=[];
             foreach($ids as $id) {
                 if(!is_string($id)||!preg_match('/^[A-Za-z0-9:_-]{8,150}$/D',$id)){$rejected[]=['record_id'=>$id,'message'=>'ID pembatalan tidak valid.'];continue;}
-                $o=one('SELECT id,device_id,cancelled FROM observations WHERE record_id=?',[$id]);
+                $o=one('SELECT id,device_id,cancelled,bib,epc FROM observations WHERE record_id=?',[$id]);
                 if($o && (int)$o['device_id']!==(int)$d['id']){$rejected[]=['record_id'=>$id,'message'=>'Catatan milik perangkat lain.'];continue;}
                 $newRequest=!one('SELECT id FROM cancel_requests WHERE record_id=? AND device_id=?',[$id,$d['id']]);
                 if($newRequest){query('INSERT INTO cancel_requests(event_id,device_id,record_id,created_ms) VALUES(?,?,?,?)',[$d['event_id'],$d['id'],$id,now_ms()]);$changed=true;}
                 if($o && !(int)$o['cancelled'] && $newRequest){query('UPDATE observations SET cancelled=1 WHERE id=?',[$o['id']]);$changed=true;}
+                if($o && $newRequest) $affected=array_merge($affected,observation_categories((int)$d['event_id'],$o['bib'],$o['epc']));
                 $accepted[]=$id;
             }
-            if($changed){revise((int)$d['event_id']);audit((int)$d['event_id'],'operator_cancel',['device_id'=>$d['id'],'record_ids'=>$accepted]);}
+            if($changed){revise((int)$d['event_id'],array_values(array_unique($affected))); query('UPDATE devices SET manual_complete=0 WHERE id=?',[$d['id']]);audit((int)$d['event_id'],'operator_cancel',['device_id'=>$d['id'],'record_ids'=>$accepted]);}
             db()->commit();json_out(['ok'=>true,'accepted_ids'=>$accepted,'rejected'=>$rejected]);
         }catch(Throwable $e){db()->rollBack();throw $e;}
     }

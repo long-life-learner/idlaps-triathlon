@@ -1,6 +1,6 @@
 # API v1
 
-Base: `https://ALAMAT-ADMIN/api.php?action=...`. HTTPS wajib di produksi. JSON UTF-8. Header autentikasi `Authorization: Bearer TOKEN`; Kodular juga dapat mengirim `token` di objek JSON POST. Token tidak dimasukkan ke URL.
+Base: `https://ALAMAT-ADMIN/api.php?action=...`. HTTPS wajib di produksi. JSON UTF-8. Header autentikasi `Authorization: Bearer TOKEN`; Kodular juga dapat mengirim `token` di objek JSON POST. Token tidak dimasukkan ke URL. Android 2.2 menggunakan base tetap `https://triathlon.idlaps.com/api.php`.
 
 | Aksi | Metode | Isi |
 | --- | --- | --- |
@@ -48,3 +48,9 @@ Pembatalan memiliki ledger tersendiri. Jika pembatalan datang sebelum catatan as
 `clock_quality`: `synced`, `holdover`, `unverified`, `stale`, atau `jump`. Catatan tidak ditolak hanya karena jam belum terverifikasi, tetapi hasil memerlukan pemeriksaan. Waktu upload tidak pernah menggantikan waktu pembacaan.
 
 Timestamp harus berupa integer epoch ms, bukan string jam. Batas pemeriksaan penerimaan awal: tahun 2000 sampai 24 jam setelah waktu server. Event lama tetap dapat dikirim dengan tanggal lengkap. Pengubahan body saat retry, termasuk status jam baru untuk catatan lama, tidak diperbolehkan.
+
+BIB manual wajib string berisi 1–3 digit ASCII (`007` dipertahankan sebagai teks dan berbeda dari `7`). BIB harus terdaftar dalam event; kategorinya ditentukan dari peserta. Unknown BIB ditolak per catatan, sehingga klien mempertahankan bukti lokal untuk diperiksa.
+
+Perbaikan BIB Android menghasilkan ID pengganti dengan `replaces_record_id` dan `correction_reason`, serta mempertahankan `captured_ms`, event, titik dan tahap. Klien lebih dahulu menunggu ACK pembatalan ID asli sebelum mengunggah pengganti. Setiap antrean memakai token penugasan asal; pemasangan baru tidak mengubah tujuan catatan lama.
+
+Konfigurasi peserta kini memuat `epcs`, array seluruh EPC (misalnya `["AA01","0002"]`), serta `epc` berupa EPC pertama untuk kompatibilitas klien lama. RFID tetap mengirim satu EPC asli pada setiap bukti; pemetaan peserta dan penggabungan multi-EPC dilakukan saat perhitungan.

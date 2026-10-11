@@ -37,6 +37,17 @@ $conflict=$row;$conflict['captured_ms']++;$reply=ingest($device,[$conflict]);che
 $bad=$row;$bad['record_id']='manual-test-2';$bad['bib']='999';$reply=ingest($device,[$row,$bad]);check(count($reply['accepted_ids'])===1&&count($reply['rejected'])===1,'Partial batch response retains rejected records');
 $cross=$row;$cross['record_id']='manual-test-3';$cross['event_id']=2;check(count(ingest($device,[$cross])['rejected'])===1,'Device cannot write another event');
 $blank=$row;unset($blank['captured_ms']);$blank['record_id']='manual-test-4';check(count(ingest($device,[$blank])['rejected'])===1,'Missing timestamp rejected');
+query('INSERT INTO devices(event_id,name,kind,checkpoint,token_hash) VALUES(?,?,?,?,?)',[1,'RFID','rfid',1,hash('sha256','rfid-token')]);
+$rfid=one('SELECT * FROM devices WHERE id=2');
+foreach([1,2,3,4] as $cp) query('INSERT INTO readers(device_id,name,host,port,checkpoint,detect_mode,interval_ms,quiet_ms,power) VALUES(?,?,?,?,?,?,?,?,?)',[2,'Reader '.$cp,'127.0.0.1',9000+$cp,$cp,$cp===1?'single':'multi',10000,2000,20]);
+$dense=[];
+foreach($base as $o)for($i=0;$i<100;$i++)$dense[]=['record_id'=>'dense-'.$o['checkpoint'].'-'.$o['captured_ms'].'-'.$i,'event_id'=>1,'epc'=>'ABCD','reader_id'=>$o['checkpoint'],'checkpoint'=>$o['checkpoint'],'captured_ms'=>$o['captured_ms']+$i*20,'clock_quality'=>'synced','detect_mode'=>$o['checkpoint']===1?'single':'multi','quiet_ms'=>2000,'interval_ms'=>10000];
+$dense[]=array_replace($dense[0],['record_id'=>'dense-before-start','captured_ms'=>$gun-1000]);
+foreach(array_chunk($dense,500) as $chunk)check(count(ingest($rfid,$chunk)['rejected'])===0,'Dense RFID batch accepted');
+$computed=compute_event(1)[0];
+check($computed['status']==='Selesai'&&$computed['total_ms']===2400000&&$computed['swim_ms']===600000,'Database streaming preserves complete route with dense reads and pre-start single detect');
+$snapshot=one('SELECT * FROM result_runs WHERE event_id=1 ORDER BY id DESC LIMIT 1');
+check((int)$snapshot['revision']===(int)one('SELECT revision FROM events WHERE id=1')['revision'],'Stored result snapshot matches event revision');
 $workbook=excel_template();$sheet=$workbook->getActiveSheet();foreach(['008','Budi','Elite','0000AB12','Club'] as $i=>$v)$sheet->setCellValueExplicit([$i+1,2],$v,\PhpOffice\PhpSpreadsheet\Cell\DataType::TYPE_STRING);
 $path=$dir.'/participants.xlsx';(new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($workbook))->save($path);$preview=preview_import($path,1);check(!$preview['errors']&&$preview['rows'][0]['bib']==='008'&&$preview['rows'][0]['epc']==='0000AB12','Excel preserves leading zeros');
 $sheet->setCellValue('B2','=1+1');(new \PhpOffice\PhpSpreadsheet\Writer\Xlsx($workbook))->save($path);check(count(preview_import($path,1)['errors'])===1,'Import rejects formulas');

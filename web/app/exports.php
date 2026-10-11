@@ -25,23 +25,23 @@ function preview_import(string $path,int $event): array {
     if($header!==['bib','nama','kategori','epc','tim']) throw new RuntimeException('Kolom harus BIB, Nama, Kategori, EPC, Tim. Gunakan template.');
     $categories=[]; foreach(rows('SELECT id,name FROM categories WHERE event_id=?',[$event]) as $c) $categories[mb_strtolower($c['name'])]=(int)$c['id'];
     $bibs=[]; $epcs=[];
-    foreach(rows('SELECT bib,epc FROM participants WHERE event_id=?',[$event]) as $p) { $bibs[$p['bib']]=true; if($p['epc']) $epcs[$p['epc']]=true; }
+    foreach(with_participant_tags(rows('SELECT id,bib,epc FROM participants WHERE event_id=?',[$event]),$event) as $p) { $bibs[$p['bib']]=true; foreach($p['epcs'] as $tag) $epcs[$tag]=true; }
     $out=[]; $errors=[];
     for($r=2;$r<=$sheet->getHighestDataRow();$r++) {
         $v=[]; $formula=false;
         foreach(range('A','E') as $col) { $cell=$sheet->getCell($col.$r); if($cell->getDataType()===DataType::TYPE_FORMULA) $formula=true; $v[]=trim((string)$cell->getFormattedValue()); }
         if(implode('',$v)==='') continue;
-        [$bib,$name,$category,$epc,$team]=$v; $epc=strtoupper(str_replace(' ','',$epc)); $reason=[];
+        [$bib,$name,$category,$epc,$team]=$v; $reason=[]; $tags=[];
+        try { $tags=parse_epcs($epc); } catch(RuntimeException $e) { $reason[]=$e->getMessage(); }
         if($formula) $reason[]='Formula tidak diperbolehkan; tempel sebagai nilai.';
-        if(!preg_match('/^[A-Za-z0-9-]{1,30}$/D',$bib)) $reason[]='BIB wajib, maksimal 30 karakter huruf/angka/tanda hubung.';
+        if(!preg_match('/^[0-9]{1,3}$/D',$bib)) $reason[]='BIB harus berisi 1–3 digit angka; nol di depan dipertahankan.';
         if($name===''||mb_strlen($name)>150||mb_strlen($team)>150) $reason[]='Nama wajib dan panjang nama/tim maksimal 150 karakter.';
         $catId=$categories[mb_strtolower($category)]??null; if(!$catId) $reason[]='Kategori belum terdaftar.';
         if(isset($bibs[$bib])) $reason[]='BIB sudah ada atau berulang dalam file.';
-        if($epc!=='' && !preg_match('/^(?:[A-F0-9]{2}){1,64}$/D',$epc)) $reason[]='EPC harus hexadecimal dengan jumlah digit genap.';
-        if($epc!=='' && isset($epcs[$epc])) $reason[]='EPC sudah dipakai.';
-        $bibs[$bib]=true; if($epc!=='') $epcs[$epc]=true;
+        foreach($tags as $tag) { if(isset($epcs[$tag])) $reason[]='EPC sudah dipakai: '.$tag; $epcs[$tag]=true; }
+        $bibs[$bib]=true;
         if($reason) $errors[]=['row'=>$r,'message'=>implode(' ',$reason)];
-        $out[]=['bib'=>$bib,'name'=>$name,'category_id'=>$catId,'category'=>$category,'epc'=>$epc?:null,'team'=>$team];
+        $out[]=['bib'=>$bib,'name'=>$name,'category_id'=>$catId,'category'=>$category,'epc'=>implode(', ',$tags)?:null,'epcs'=>$tags,'team'=>$team];
     }
     if(!$out) $errors[]=['row'=>0,'message'=>'File belum berisi peserta.'];
     return ['event_id'=>$event,'rows'=>$out,'errors'=>$errors];
@@ -53,7 +53,7 @@ function result_book(array $event,array $run,array $results): Spreadsheet {
     foreach($groups as $id=>$group) {
         $s=$book->createSheet(); $s->setTitle('Kategori '.$id);
         $s->setCellValueExplicit('A1',$event['name'].' — '.($group[0]['category']??'Belum ada peserta'),DataType::TYPE_STRING); $s->mergeCells('A1:K1');
-        $s->setCellValue('A2',((int)$run['official']?'RESMI':'SEMENTARA').' · Dihitung '.local_time((int)$run['created_ms'],$event['timezone']).' '.$event['timezone']); $s->mergeCells('A2:K2');
+        $s->setCellValue('A2',(!empty($run['category_official'][$id])?'RESMI':'SEMENTARA').' · Dihitung '.local_time((int)$run['created_ms'],$event['timezone']).' '.$event['timezone']); $s->mergeCells('A2:K2');
         $s->setCellValue('A3','Gun time: '.(isset($group[0])?local_time($group[0]['gun_ms'],$event['timezone']):'—')); $s->mergeCells('A3:K3');
         $headers=['Peringkat','BIB','Nama','Tim','Swim','T1','Cycle','T2','Run','Total','Status','Sumber per tahap','Catatan'];
         foreach($headers as $i=>$label) $s->setCellValue([$i+1,5],$label);
@@ -72,10 +72,10 @@ function result_book(array $event,array $run,array $results): Spreadsheet {
     return $book;
 }
 function result_pdf(array $event,array $run,array $results): string {
-    $html='<html><head><meta charset="utf-8"><style>@page{margin:28px}body{font-family:DejaVu Sans,sans-serif;font-size:9px;color:#17313b}h1{font-size:20px}h2{font-size:14px;margin-top:24px}table{width:100%;border-collapse:collapse}th{background:#17313b;color:white;text-align:left}th,td{padding:6px;border-bottom:1px solid #dde5e7}thead{display:table-header-group}tr{page-break-inside:avoid}.note{font-size:8px;color:#53636b}</style></head><body><h1>'.h($event['name']).'</h1><p>'.((int)$run['official']?'HASIL RESMI':'HASIL SEMENTARA').' · '.h(local_time((int)$run['created_ms'],$event['timezone'])).' '.h($event['timezone']).'</p><p class="note">M = manual, R = RFID, A = koreksi admin. Sumber berurutan mengikuti tahap/putaran rute. Peringkat memakai durasi penuh; tampilan sampai detik.</p>';
+    $html='<html><head><meta charset="utf-8"><style>@page{margin:28px}body{font-family:DejaVu Sans,sans-serif;font-size:9px;color:#17313b}h1{font-size:20px}h2{font-size:14px;margin-top:24px}table{width:100%;border-collapse:collapse}th{background:#17313b;color:white;text-align:left}th,td{padding:6px;border-bottom:1px solid #dde5e7}thead{display:table-header-group}tr{page-break-inside:avoid}.note{font-size:8px;color:#53636b}</style></head><body><h1>'.h($event['name']).'</h1><p>'.'HASIL PER KATEGORI'.' · '.h(local_time((int)$run['created_ms'],$event['timezone'])).' '.h($event['timezone']).'</p><p class="note">M = manual, R = RFID, A = koreksi admin. Sumber berurutan mengikuti tahap/putaran rute. Peringkat memakai durasi penuh; tampilan sampai detik.</p>';
     $groups=[]; foreach($results as $r) $groups[$r['category_id']][]=$r;
     foreach($groups as $group) {
-        $first=$group[0]; $html.='<h2>'.h($first['category']).'</h2><p>Gun time '.h(local_time($first['gun_ms'],$event['timezone'])).' · '.($first['gun_official']?'resmi':'jadwal sementara').'</p><table><thead><tr>';
+        $first=$group[0]; $html.='<h2>'.h($first['category']).' · '.(!empty($run['category_official'][$first['category_id']])?'RESMI':'SEMENTARA').'</h2><p>Gun time '.h(local_time($first['gun_ms'],$event['timezone'])).' · '.($first['gun_official']?'resmi':'jadwal sementara').'</p><table><thead><tr>';
         foreach(['#','BIB / Nama','Swim','T1','Cycle','T2','Run','Total','Status / sumber'] as $v) $html.='<th>'.h($v).'</th>';
         $html.='</tr></thead><tbody>';
         foreach($group as $r) {

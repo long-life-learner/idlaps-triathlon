@@ -18,6 +18,7 @@ function install_schema(PDO $db): void {
         "audit (id $id, event_id BIGINT NULL, actor VARCHAR(100) NOT NULL, action VARCHAR(100) NOT NULL, detail_json LONGTEXT NOT NULL, created_ms BIGINT NOT NULL)",
     ];
     foreach ($tables as $table) $db->exec('CREATE TABLE IF NOT EXISTS '.$table);
+    upgrade_tag_schema($db);
     foreach (['obs_event_time' => 'observations(event_id,captured_ms)', 'obs_epc_time'=>'observations(event_id,epc,captured_ms)', 'obs_bib'=>'observations(event_id,bib)', 'obs_device' => 'observations(device_id)', 'participants_category' => 'participants(category_id)', 'audit_event' => 'audit(event_id)'] as $name => $on) {
         try { $db->exec("CREATE INDEX $name ON $on"); } catch (PDOException $e) { if (!str_contains(strtolower($e->getMessage()), 'exist') && !str_contains(strtolower($e->getMessage()), 'duplicate')) throw $e; }
     }

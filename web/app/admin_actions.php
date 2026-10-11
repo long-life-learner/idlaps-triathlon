@@ -12,16 +12,9 @@ function admin_action(string $action,int $eventId): string {
         if(($_FILES['file']['error']??UPLOAD_ERR_NO_FILE)!==UPLOAD_ERR_OK) throw new RuntimeException('Unggahan gagal. Pilih file .xlsx maksimal 5 MB.');
         $_SESSION['import']=preview_import($_FILES['file']['tmp_name'],$eventId); return 'Periksa pratinjau sebelum menyimpan peserta.';
     }
-    if($action==='legacy_preview') { $_SESSION['legacy']=legacy_preview(one('SELECT * FROM events WHERE id=?',[$eventId]),$_POST); return 'Periksa tanggal, jenis lintasan, dan waktu arsip sebelum impor.'; }
-    if($action==='legacy_commit') {
-        $preview=$_SESSION['legacy']??null;
-        if(!$preview || $preview['event_id']!==$eventId) throw new RuntimeException('Pratinjau arsip tidak tersedia.');
-        $reply=legacy_commit($preview); $_SESSION['legacy_rejected']=$reply['rejected']; unset($_SESSION['legacy']);
-        return count($reply['accepted']).' catatan diterima; '.count($reply['rejected']).' ditolak. Jam arsip ditandai belum terverifikasi sampai ditinjau.';
-    }
     db()->beginTransaction();
     try {
-        $event=lock_event($eventId); $detail=[]; $msg='Perubahan disimpan.';
+        $event=lock_event($eventId); $detail=[]; $affected=[]; $msg='Perubahan disimpan.';
         switch($action) {
             case 'category':
                 $name=trim((string)($_POST['name']??'')); if($name===''||mb_strlen($name)>100) throw new RuntimeException('Nama kategori wajib, maksimal 100 karakter.');
@@ -29,24 +22,37 @@ function admin_action(string $action,int $eventId): string {
                 $bike=(int)$_POST['bike_laps']; $run=(int)$_POST['run_laps']; $bikeMin=(int)$_POST['bike_min_s']; $runMin=(int)$_POST['run_min_s'];
                 if(min($bike,$run)<1||max($bike,$run)>100||min($bikeMin,$runMin)<0) throw new RuntimeException('Putaran 1–100 dan durasi minimum tidak boleh negatif.');
                 $catId=(int)($_POST['id']??0); $detail=['before'=>$catId?one('SELECT * FROM categories WHERE id=? AND event_id=?',[$catId,$eventId]):null,'name'=>$name,'official_ms'=>$official];
+                if($detail['before'] && ((int)$detail['before']['bike_laps']!==$bike || (int)$detail['before']['run_laps']!==$run) && one('SELECT id FROM observations WHERE event_id=? AND test=0 LIMIT 1',[$eventId])) throw new RuntimeException('Jumlah putaran sudah digunakan dalam pencatatan. Tetapkan rute sebelum lomba; gunakan event baru untuk rute berbeda. Gun time tetap dapat diperbarui.');
                 if($catId) { if(!$detail['before']) throw new RuntimeException('Kategori tidak ditemukan.'); query('UPDATE categories SET name=?,scheduled_ms=?,official_ms=?,bike_laps=?,run_laps=?,bike_min_s=?,run_min_s=? WHERE id=? AND event_id=?',[$name,$start,$official,$bike,$run,$bikeMin,$runMin,$catId,$eventId]); }
                 else query('INSERT INTO categories(event_id,name,scheduled_ms,official_ms,bike_laps,run_laps,bike_min_s,run_min_s) VALUES(?,?,?,?,?,?,?,?)',[$eventId,$name,$start,$official,$bike,$run,$bikeMin,$runMin]);
+                $affected[]=$catId?: (int)db()->lastInsertId();
                 break;
             case 'participant':
-                $id=(int)($_POST['id']??0); $bib=trim((string)$_POST['bib']); $name=trim((string)$_POST['name']); $team=trim((string)($_POST['team']??'')); $epc=strtoupper(str_replace(' ','',trim((string)($_POST['epc']??'')))); $cat=(int)$_POST['category_id']; $status=(string)($_POST['race_status']??'active');
-                if(!preg_match('/^[A-Za-z0-9-]{1,30}$/D',$bib)||$name===''||mb_strlen($name)>150||mb_strlen($team)>150) throw new RuntimeException('BIB/nama/tim tidak valid.');
-                if($epc!==''&&!preg_match('/^(?:[A-F0-9]{2}){1,64}$/D',$epc)) throw new RuntimeException('EPC harus hexadecimal dengan jumlah digit genap.');
+                $id=(int)($_POST['id']??0); $bib=trim((string)$_POST['bib']); $name=trim((string)$_POST['name']); $team=trim((string)($_POST['team']??'')); $epcs=parse_epcs((string)($_POST['epc']??'')); $cat=(int)$_POST['category_id']; $status=(string)($_POST['race_status']??'active');
+                if(!preg_match('/^[0-9]{1,3}$/D',$bib)||$name===''||mb_strlen($name)>150||mb_strlen($team)>150) throw new RuntimeException('BIB/nama/tim tidak valid.');
                 if(!one('SELECT id FROM categories WHERE id=? AND event_id=?',[$cat,$eventId])||!in_array($status,['active','dns','dnf','dsq'],true)) throw new RuntimeException('Kategori/status tidak valid.');
+                if($status==='dsq' && trim((string)($_POST['status_reason']??''))==='') throw new RuntimeException('Alasan diskualifikasi wajib diisi.');
                 if($id) {
-                    $old=one('SELECT * FROM participants WHERE id=? AND event_id=?',[$id,$eventId]); if(!$old||$old['bib']!==$bib) throw new RuntimeException('BIB peserta yang sudah disimpan tidak boleh diubah.'); $detail=['before'=>$old];
-                    query('UPDATE participants SET name=?,team=?,epc=?,category_id=?,race_status=? WHERE id=? AND event_id=?',[$name,$team,$epc?:null,$cat,$status,$id,$eventId]);
-                } else query('INSERT INTO participants(event_id,category_id,bib,name,team,epc) VALUES(?,?,?,?,?,?)',[$eventId,$cat,$bib,$name,$team,$epc?:null]);
+                    $old=one('SELECT * FROM participants WHERE id=? AND event_id=?',[$id,$eventId]); if(!$old||$old['bib']!==$bib) throw new RuntimeException('BIB peserta yang sudah disimpan tidak boleh diubah.'); $old['epcs']=with_participant_tags([$old],$eventId)[0]['epcs']; $detail=['before'=>$old,'reason'=>trim((string)($_POST['status_reason']??''))]; $affected[]=(int)$old['category_id'];
+                    query('UPDATE participants SET name=?,team=?,category_id=?,race_status=? WHERE id=? AND event_id=?',[$name,$team,$cat,$status,$id,$eventId]);
+                } else { query('INSERT INTO participants(event_id,category_id,bib,name,team,race_status) VALUES(?,?,?,?,?,?)',[$eventId,$cat,$bib,$name,$team,$status]); $id=(int)db()->lastInsertId(); $detail=['bib'=>$bib,'after'=>$status,'reason'=>trim((string)($_POST['status_reason']??''))]; }
+                save_participant_tags($eventId,$id,$epcs); $detail['epcs']=$epcs;
+                $affected[]=$cat;
+                break;
+            case 'participant_status':
+                $p=one('SELECT * FROM participants WHERE id=? AND event_id=?',[(int)($_POST['id']??0),$eventId]);
+                $status=(string)($_POST['race_status']??''); $reason=trim((string)($_POST['reason']??''));
+                if(!$p || !in_array($status,['active','dns','dnf','dsq'],true)) throw new RuntimeException('Peserta atau status tidak valid.');
+                if($status==='dsq' && $reason==='') throw new RuntimeException('Alasan diskualifikasi wajib diisi.');
+                query('UPDATE participants SET race_status=? WHERE id=?',[$status,$p['id']]);
+                $affected[]=(int)$p['category_id']; $detail=['bib'=>$p['bib'],'before'=>$p['race_status'],'after'=>$status,'reason'=>$reason];
+                $msg='Status peserta disimpan. Tekan Hitung Hasil untuk memperbarui peringkat.';
                 break;
             case 'import_commit':
                 $import=$_SESSION['import']??null;
                 if(!$import||$import['event_id']!==$eventId||$import['errors']) throw new RuntimeException('Pratinjau impor belum valid.');
-                foreach($import['rows'] as $p) query('INSERT INTO participants(event_id,category_id,bib,name,team,epc) VALUES(?,?,?,?,?,?)',[$eventId,$p['category_id'],$p['bib'],$p['name'],$p['team'],$p['epc']]);
-                $msg=count($import['rows']).' peserta ditambahkan.'; $detail=['count'=>count($import['rows'])]; unset($_SESSION['import']); break;
+                foreach($import['rows'] as $p) { query('INSERT INTO participants(event_id,category_id,bib,name,team) VALUES(?,?,?,?,?)',[$eventId,$p['category_id'],$p['bib'],$p['name'],$p['team']]); save_participant_tags($eventId,(int)db()->lastInsertId(),$p['epcs']??parse_epcs((string)($p['epc']??''))); }
+                $affected=array_map('intval',array_column($import['rows'],'category_id')); $msg=count($import['rows']).' peserta ditambahkan.'; $detail=['count'=>count($import['rows'])]; unset($_SESSION['import']); break;
             case 'device':
                 $name=trim((string)$_POST['name']); $kind=(string)$_POST['kind']; $cp=(int)$_POST['checkpoint'];
                 if($name===''||mb_strlen($name)>100||!in_array($kind,['manual','rfid'],true)||$cp<1||$cp>4) throw new RuntimeException('Penugasan perangkat tidak valid.');
@@ -72,7 +78,7 @@ function admin_action(string $action,int $eventId): string {
             case 'cancel':
                 $reason=trim((string)$_POST['reason']); if($reason==='') throw new RuntimeException('Alasan pembatalan wajib.');
                 $o=one('SELECT * FROM observations WHERE id=? AND event_id=?',[(int)$_POST['id'],$eventId]); if(!$o) throw new RuntimeException('Catatan tidak ditemukan.');
-                query('UPDATE observations SET cancelled=? WHERE id=?',[(int)$o['cancelled']?0:1,$o['id']]); $detail=['record_id'=>$o['record_id'],'reason'=>$reason,'before_cancelled'=>$o['cancelled']]; break;
+                query('UPDATE observations SET cancelled=? WHERE id=?',[(int)$o['cancelled']?0:1,$o['id']]); $affected=observation_categories($eventId,$o['bib'],$o['epc']); $detail=['record_id'=>$o['record_id'],'reason'=>$reason,'before_cancelled'=>$o['cancelled']]; break;
             case 'decision':
                 $bib=trim((string)$_POST['bib']); $key=(string)$_POST['step_key']; $reason=trim((string)$_POST['reason']);
                 $p=one('SELECT c.* FROM participants p JOIN categories c ON c.id=p.category_id WHERE p.event_id=? AND p.bib=?',[$eventId,$bib]);
@@ -80,19 +86,13 @@ function admin_action(string $action,int $eventId): string {
                 $ms=parse_local((string)$_POST['captured'],$event['timezone']);
                 $old=one('SELECT * FROM decisions WHERE event_id=? AND bib=? AND step_key=?',[$eventId,$bib,$key]);
                 if($old) query('UPDATE decisions SET captured_ms=?,reason=? WHERE id=?',[$ms,$reason,$old['id']]); else query('INSERT INTO decisions(event_id,bib,step_key,captured_ms,reason) VALUES(?,?,?,?,?)',[$eventId,$bib,$key,$ms,$reason]);
-                $detail=['before'=>$old,'bib'=>$bib,'step_key'=>$key,'captured_ms'=>$ms,'reason'=>$reason]; break;
+                $affected=observation_categories($eventId,$bib,null); $detail=['before'=>$old,'bib'=>$bib,'step_key'=>$key,'captured_ms'=>$ms,'reason'=>$reason]; break;
             case 'remove_decision':
-                $d=one('SELECT * FROM decisions WHERE id=? AND event_id=?',[(int)$_POST['id'],$eventId]); if(!$d||trim((string)$_POST['reason'])==='') throw new RuntimeException('Koreksi/alasan tidak valid.'); query('DELETE FROM decisions WHERE id=?',[$d['id']]); $detail=['before'=>$d,'reason'=>$_POST['reason']]; break;
+                $d=one('SELECT * FROM decisions WHERE id=? AND event_id=?',[(int)$_POST['id'],$eventId]); if(!$d||trim((string)$_POST['reason'])==='') throw new RuntimeException('Koreksi/alasan tidak valid.'); query('DELETE FROM decisions WHERE id=?',[$d['id']]); $affected=observation_categories($eventId,$d['bib'],null); $detail=['before'=>$d,'reason'=>$_POST['reason']]; break;
             case 'official':
-                $run=one('SELECT * FROM result_runs WHERE event_id=? ORDER BY id DESC LIMIT 1',[$eventId]);
-                if(!$run||(int)$run['revision']!==(int)$event['revision']) throw new RuntimeException('Hitung ulang hasil terlebih dahulu.');
-                if(one('SELECT id FROM categories WHERE event_id=? AND official_ms IS NULL',[$eventId])) throw new RuntimeException('Isi gun time resmi semua kategori.');
-                if(one('SELECT id FROM devices WHERE event_id=? AND kind=? AND manual_complete=0 AND revoked=0',[$eventId,'manual'])) throw new RuntimeException('Pastikan seluruh perangkat manual sudah selesai mengirim.');
-                foreach(json_decode($run['result_json'],true) as $r) if($r['status']==='Perlu diperiksa') throw new RuntimeException('Selesaikan pemeriksaan peserta atau tetapkan DNF/DNS/DSQ.');
-                if(empty($_POST['accept_rfid'])) throw new RuntimeException('Konfirmasi penggunaan RFID untuk catatan manual yang tidak tersedia.');
-                query('UPDATE result_runs SET official=1 WHERE id=?',[$run['id']]); audit($eventId,'official',['run_id'=>$run['id']]); db()->commit(); return 'Hasil ditetapkan resmi. Data baru tetap akan menandai hasil perlu dihitung ulang.';
+                publish_category($eventId,(int)($_POST['category_id']??0)); db()->commit(); return 'Hasil kategori ditetapkan resmi.';
             default: throw new RuntimeException('Aksi tidak dikenal.');
         }
-        revise($eventId); query('UPDATE devices SET config_version=config_version+1 WHERE event_id=?',[$eventId]); audit($eventId,$action,$detail); db()->commit(); return $msg;
+        revise($eventId,array_values(array_unique($affected))); query('UPDATE devices SET config_version=config_version+1 WHERE event_id=?',[$eventId]); audit($eventId,$action,$detail); db()->commit(); return $msg;
     } catch(Throwable $e) { db()->rollBack(); throw $e; }
 }
